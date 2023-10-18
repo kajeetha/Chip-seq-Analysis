@@ -1,0 +1,125 @@
+---
+title: "Roadmap Chip-seq"
+output: html_document
+date: "2023-10-09"
+---
+
+#The Chipseeker package (Yu, Wang, and He 2015) implements functions that use Chip-seq data to retrieve the nearest genes around the peak, to annotate genomic region of the peak, among others
+
+```{r setup, include=FALSE}
+library(ChIPseeker)
+library(pbapply)
+library(ggplot2)
+library(SingleCellExperiment)
+```
+
+#lets retrieve 10 samples from 2 different cancer datasets
+```{r}
+lgg.samples <- matchedMetExp("TCGA-LGG", n = 10)
+gbm.samples <- matchedMetExp("TCGA-GBM", n = 10)
+samples <- c(lgg.samples,gbm.samples)
+
+query <- GDCquery(
+  project = c("TCGA-LGG","TCGA-GBM"),
+  data.category = "DNA Methylation",
+  platform = "Illumina Human Methylation 450",
+  data.type = "Methylation Beta Value",
+  barcode = samples
+)
+
+
+GDCdownload(query)
+met <- GDCprepare(
+  query = query, 
+  save = FALSE
+)
+```
+
+#We will only be using chr9 in this case and will remove probes with NA:
+```{r}
+met <- subset(met,subset = as.character(seqnames(met)) %in% c("chr9"))
+met <- met[rowSums(is.na(assay(met))) == 0,]
+```
+
+#This searches for differentially methylated sites
+```{r}
+dmc <- TCGAanalyze_DMC(
+  data = met,
+  groupCol = "project_id", # a column in the colData matrix
+  group1 = "TCGA-GBM", # a type of the disease type column
+  group2 = "TCGA-LGG", # a type of the disease column
+  p.cut = 0.05, #statistically significant differentially methylated CpGs
+  diffmean.cut = 0.15,
+  save = FALSE,
+  legend = "State",
+  plot.filename = "LGG_GBM_metvolcano.png",
+  cores = 1 # if set to 1 there will be a progress bar
+)
+```
+
+## This creates a link to annotation hub
+
+```{r cars}
+library(AnnotationHub)
+ah = AnnotationHub()
+```
+
+## Lets search for brain consolidated epigenomes in the roadmap database specifically the narrowPeak files associated with peak calling and using a specific sample. 
+
+```{r pressure, echo=FALSE}
+bpChipEpi_brain <- query(ah , c("EpigenomeRoadMap", "narrowPeak", "chip", "consolidated","brain","E068"))
+
+#this uses annotation hub to query the data and name the histone markers
+
+histone.marks <- pblapply(names(bpChipEpi_brain), function(x) {ah[[x]]})
+
+names(histone.marks) <- names(bpChipEpi_brain) 
+```
+
+#Now that we have downloaded histone marks specific to the brain Chipseeker will be used to visualize how these histone modification are enriched in hypomethylated and hymermethylated regions via heatmap and average profile of peaks. 
+```{r}
+#lets create a GR object based on hypo and hyper methylated probes in the TCGA-GBM project
+probes <- keepStandardChromosomes(
+  rowRanges(met)[rownames(dmc)[dmc$status %in% c("Hypermethylated in TCGA-GBM", "Hypomethylated in TCGA-GBM")],]
+)
+```
+
+# Defining a window of 3kbp - 3kbp_probe_3kbp which are the flanking sequence of the TSS sites
+```{r}
+attributes(probes)$type <- "start_site"
+attributes(probes)$downstream <- 3000
+attributes(probes)$upstream <- 3000
+probes <- GenomicRanges::resize(probes,6001,fix = "center")
+```
+
+#A tag matrix is created to make protein binding or histone modifications  to specific genomic regions.
+
+```{r}
+tagMatrixList <- pbapply::pblapply(histone.marks, function(x) {
+  getTagMatrix(keepStandardChromosomes(x), windows = probes, weightCol = "score")
+})
+```
+# change names retrieved with the following command: basename(bpChipEpi_brain$title)
+
+```{r}
+names(tagMatrixList) <- c("H3K4me1","H3K4me3", "H3K9ac", "H3K9me3", "H3K27ac",  "H3K27me3", "H3K36me3")
+```
+
+#This plots the heatmap:
+```{r}
+tagHeatmap(tagMatrixList)
+
+p <- plotAvgProf(tagMatrixList, xlim = c(-3000,3000), xlab = "Genomic Region (5'->3', centered on CpG)")
+
+# We are centreing in the CpG instead of the TSS. So we'll change the labels manually
+p <- p + scale_x_continuous(
+  breaks = c(-3000,-1500,0,1500,3000),
+  labels = c(-3000,-1500,"CpG",1500,3000)
+)
+
+library(ggthemes)
+p + theme_few() + scale_colour_few(name = "Histone marks") +  guides(colour = guide_legend(override.aes = list(size=4)))
+
+```
+
+
